@@ -828,7 +828,7 @@ void lv_obj_get_transformed_area(const lv_obj_t * obj, lv_area_t * area, bool re
     area->x2 = LV_MAX4(p[0].x, p[1].x, p[2].x, p[3].x);
     area->y1 = LV_MIN4(p[0].y, p[1].y, p[2].y, p[3].y);
     area->y2 = LV_MAX4(p[0].y, p[1].y, p[2].y, p[3].y);
-    lv_area_increase(area, 5, 5);
+    // lv_area_increase(area, 5, 5);
 }
 
 void lv_obj_invalidate_area(const lv_obj_t * obj, const lv_area_t * area)
