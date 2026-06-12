@@ -14,6 +14,12 @@
 #include "../misc/lv_bidi.h"
 #include "../misc/lv_assert.h"
 
+#ifdef ESP_PLATFORM
+#include "esp_task_wdt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
+
 /*********************
  *      DEFINES
  *********************/
@@ -35,6 +41,18 @@ typedef uint8_t cmd_state_t;
  **********************/
 
 static uint8_t hex_char_to_num(char hex);
+
+#ifdef ESP_PLATFORM
+static void lv_draw_label_feed_wdt(TickType_t * last_yield_tick)
+{
+    TickType_t now = xTaskGetTickCount();
+    if(now - *last_yield_tick >= pdMS_TO_TICKS(20)) {
+        *last_yield_tick = now;
+        if(esp_task_wdt_status(NULL) == ESP_OK) esp_task_wdt_reset();
+        vTaskDelay(1);
+    }
+}
+#endif
 
 /**********************
  *  STATIC VARIABLES
@@ -211,6 +229,10 @@ void LV_ATTRIBUTE_FAST_MEM lv_draw_label(lv_draw_ctx_t * draw_ctx, const lv_draw
     draw_dsc_sel.bg_color = dsc->sel_bg_color;
 
     int32_t pos_x_start = pos.x;
+#ifdef ESP_PLATFORM
+    uint32_t wdt_char_count = 0;
+    TickType_t last_yield_tick = xTaskGetTickCount();
+#endif
     /*Write out all lines*/
     while(txt[line_start] != '\0') {
         pos.x += x_ofs;
@@ -240,6 +262,12 @@ void LV_ATTRIBUTE_FAST_MEM lv_draw_label(lv_draw_ctx_t * draw_ctx, const lv_draw
             uint32_t letter;
             uint32_t letter_next;
             _lv_txt_encoded_letter_next_2(bidi_txt, &letter, &letter_next, &i);
+#ifdef ESP_PLATFORM
+            wdt_char_count++;
+            if((wdt_char_count & 0x0FU) == 0U) {
+                lv_draw_label_feed_wdt(&last_yield_tick);
+            }
+#endif
             /*Handle the re-color command*/
             if((dsc->flag & LV_TEXT_FLAG_RECOLOR) != 0) {
                 if(letter == (uint32_t)LV_TXT_COLOR_CMD[0]) {
