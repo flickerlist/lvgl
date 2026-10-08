@@ -396,6 +396,10 @@ static bool lv_ft_font_init_cache(lv_ft_info_t * info)
     return true;
 
 Fail:
+    /* LookupSize may have cached a face before failing to create its size.
+     * Remove it while the FaceID and filename are still alive. */
+    FTC_Manager_RemoveFaceID(cache_manager, (FTC_FaceID)dsc);
+    if(dsc->name) name_refer_del(dsc->name);
     lv_mem_free(dsc);
     return false;
 }
