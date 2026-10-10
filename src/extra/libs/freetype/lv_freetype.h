@@ -70,6 +70,9 @@ bool lv_ft_font_init(lv_ft_info_t * info);
  */
 void lv_ft_font_destroy(lv_font_t * font);
 
+/* 字体发生读取或渲染错误后保持停用，重新创建字体才能恢复。 */
+bool lv_ft_font_failed(const lv_font_t * font);
+
 /**********************
  *      MACROS
  **********************/
