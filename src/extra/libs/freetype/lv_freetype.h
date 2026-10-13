@@ -70,8 +70,14 @@ bool lv_ft_font_init(lv_ft_info_t * info);
  */
 void lv_ft_font_destroy(lv_font_t * font);
 
-/* 字体发生读取或渲染错误后保持停用，重新创建字体才能恢复。 */
+/* Permanent corruption/unsupported data; resource pressure is tracked separately. */
 bool lv_ft_font_failed(const lv_font_t * font);
+bool lv_ft_font_unavailable(const lv_font_t * font);
+bool lv_ft_font_retry_pending(const lv_font_t * font);
+/* GUI only, after glyph callbacks return. Clears transient failure when due;
+ * at most three retries (500/1000/1500 ms), with no allocation or file I/O.
+ * Caller must invalidate text after a true result to render with this backend. */
+bool lv_ft_font_retry(lv_font_t * font);
 
 /**********************
  *      MACROS

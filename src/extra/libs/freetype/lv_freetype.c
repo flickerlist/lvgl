@@ -16,6 +16,7 @@
 #include FT_SIZES_H
 #include FT_IMAGE_H
 #include FT_OUTLINE_H
+#include <errno.h>
 
 /*********************
  *      DEFINES
@@ -45,6 +46,9 @@ typedef struct {
     uint16_t    height;
     /* 首次读取/渲染失败后封锁此后端，避免 GUI 反复读同一损坏字形。 */
     bool failed;
+    bool retry_needed;
+    uint8_t retry_count;
+    uint32_t error_tick;
 } lv_font_fmt_ft_dsc_t;
 
 /**********************
@@ -183,6 +187,47 @@ bool lv_ft_font_failed(const lv_font_t * font)
     return !font || !font->dsc || ((lv_font_fmt_ft_dsc_t *)font->dsc)->failed;
 }
 
+bool lv_ft_font_unavailable(const lv_font_t * font)
+{
+    return lv_ft_font_failed(font) || ((lv_font_fmt_ft_dsc_t *)font->dsc)->retry_needed;
+}
+
+bool lv_ft_font_retry_pending(const lv_font_t * font)
+{
+    if(!font || !font->dsc) return false;
+    const lv_font_fmt_ft_dsc_t * dsc = font->dsc;
+    return !dsc->failed && dsc->retry_needed && dsc->retry_count < 3;
+}
+
+bool lv_ft_font_retry(lv_font_t * font)
+{
+    if(!lv_ft_font_retry_pending(font)) return false;
+    lv_font_fmt_ft_dsc_t * dsc = (lv_font_fmt_ft_dsc_t *)font->dsc;
+    if(lv_tick_elaps(dsc->error_tick) < 500U * (dsc->retry_count + 1U)) return false;
+    ++dsc->retry_count;
+    dsc->retry_needed = false;
+    return true;
+}
+
+static void font_glyph_error(lv_font_fmt_ft_dsc_t * dsc, FT_Error error)
+{
+    const FT_Error base = FT_ERROR_BASE(error);
+    const bool resource_pressure = base == FT_Err_Out_Of_Memory ||
+        ((base == FT_Err_Cannot_Open_Resource || base == FT_Err_Cannot_Open_Stream) &&
+         (errno == EMFILE || errno == ENFILE || errno == ENOMEM));
+    dsc->retry_needed = resource_pressure;
+    dsc->failed = !resource_pressure;
+    dsc->error_tick = lv_tick_get();
+}
+
+static void font_glyph_succeeded(lv_font_fmt_ft_dsc_t * dsc)
+{
+    /* A different good glyph in the same repaint must not reset a failing
+     * glyph's retry budget. Rearm only after a minute of successful use. */
+    if(dsc->retry_count && lv_tick_elaps(dsc->error_tick) >= 60000U)
+        dsc->retry_count = 0;
+}
+
 /**********************
  *   STATIC FUNCTIONS
  **********************/
@@ -209,12 +254,12 @@ static FT_Error font_face_requester(FTC_FaceID face_id,
     return FT_Err_Ok;
 }
 
-static bool get_bold_glyph(const lv_font_t * font, FT_Face face,
+static FT_Error get_bold_glyph(const lv_font_t * font, FT_Face face,
                            FT_UInt glyph_index, lv_font_glyph_dsc_t * dsc_out)
 {
-    if(FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT)) {
-        return false;
-    }
+    errno = 0;
+    FT_Error error = FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
+    if(error) return error;
 
     lv_font_fmt_ft_dsc_t * dsc = (lv_font_fmt_ft_dsc_t *)(font->dsc);
     if(face->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
@@ -224,9 +269,9 @@ static bool get_bold_glyph(const lv_font_t * font, FT_Face face,
         }
     }
 
-    if(FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL)) {
-        return false;
-    }
+    errno = 0;
+    error = FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
+    if(error) return error;
 
     dsc_out->adv_w = (face->glyph->metrics.horiAdvance >> 6);
     dsc_out->box_h = face->glyph->bitmap.rows;         /*Height of the bitmap in [px]*/
@@ -236,7 +281,7 @@ static bool get_bold_glyph(const lv_font_t * font, FT_Face face,
                      face->glyph->bitmap.rows;         /*Y offset of the bitmap measured from the as line*/
     dsc_out->bpp = 8;         /*Bit per pixel: 1/2/4/8*/
 
-    return true;
+    return FT_Err_Ok;
 }
 
 static bool get_glyph_dsc_cb_cache(const lv_font_t * font,
@@ -254,7 +299,7 @@ static bool get_glyph_dsc_cb_cache(const lv_font_t * font,
     }
 
     lv_font_fmt_ft_dsc_t * dsc = (lv_font_fmt_ft_dsc_t *)(font->dsc);
-    if(dsc->failed)
+    if(dsc->failed || dsc->retry_needed)
         return false;
 
     FTC_FaceID face_id = (FTC_FaceID)dsc;
@@ -264,8 +309,10 @@ static bool get_glyph_dsc_cb_cache(const lv_font_t * font,
     scaler.width = dsc->height;
     scaler.height = dsc->height;
     scaler.pixel = 1;
-    if(FTC_Manager_LookupSize(cache_manager, &scaler, &face_size) != 0) {
-        dsc->failed = true;
+    errno = 0;
+    FT_Error lookup_error = FTC_Manager_LookupSize(cache_manager, &scaler, &face_size);
+    if(lookup_error) {
+        font_glyph_error(dsc, lookup_error);
         return false;
     }
 
@@ -285,9 +332,10 @@ static bool get_glyph_dsc_cb_cache(const lv_font_t * font,
 
     if(dsc->style & FT_FONT_STYLE_BOLD) {
         current_face = face;
-        if(!get_bold_glyph(font, face, glyph_index, dsc_out)) {
+        FT_Error error = get_bold_glyph(font, face, glyph_index, dsc_out);
+        if(error) {
             current_face = NULL;
-            dsc->failed = true;
+            font_glyph_error(dsc, error);
             return false;
         }
         goto end;
@@ -300,12 +348,13 @@ static bool get_glyph_dsc_cb_cache(const lv_font_t * font,
     desc_type.width = dsc->height;
 
 #if LV_FREETYPE_SBIT_CACHE
+    errno = 0;
     FT_Error error = FTC_SBitCache_Lookup(sbit_cache, &desc_type, glyph_index, &sbit, NULL);
     /* SBIT 会把非内存不足的加载错误转换成成功，须同时检查不可用标记。
      * 合法空格是 width=0，不能仅凭 buffer=NULL 判定坏字形。 */
     if(error || (sbit->width == 255 && sbit->height == 0 && !sbit->buffer)) {
+        font_glyph_error(dsc, error ? error : FT_Err_Invalid_Outline);
         LV_LOG_ERROR("SBitCache_Lookup error");
-        dsc->failed = true;
         return false;
     }
 
@@ -316,10 +365,11 @@ static bool get_glyph_dsc_cb_cache(const lv_font_t * font,
     dsc_out->ofs_y = sbit->top - sbit->height; /*Y offset of the bitmap measured from the as line*/
     dsc_out->bpp = 8;               /*Bit per pixel: 1/2/4/8*/
 #else
+    errno = 0;
     FT_Error error = FTC_ImageCache_Lookup(image_cache, &desc_type, glyph_index, &image_glyph, NULL);
     if(error) {
+        font_glyph_error(dsc, error);
         LV_LOG_ERROR("ImageCache_Lookup error");
-        dsc->failed = true;
         return false;
     }
     if(image_glyph->format != FT_GLYPH_FORMAT_BITMAP) {
@@ -343,6 +393,7 @@ end:
         dsc_out->adv_w = dsc_out->box_w + dsc_out->ofs_x;
     }
 
+    font_glyph_succeeded(dsc);
     return true;
 }
 
@@ -351,7 +402,7 @@ static const uint8_t * get_glyph_bitmap_cb_cache(const lv_font_t * font, uint32_
     LV_UNUSED(unicode_letter);
 
     lv_font_fmt_ft_dsc_t * dsc = (lv_font_fmt_ft_dsc_t *)(font->dsc);
-    if(dsc->failed)
+    if(dsc->failed || dsc->retry_needed)
         return NULL;
     if(dsc->style & FT_FONT_STYLE_BOLD) {
         if(current_face && current_face->glyph->format == FT_GLYPH_FORMAT_BITMAP) {
@@ -495,7 +546,7 @@ static bool get_glyph_dsc_cb_nocache(const lv_font_t * font,
 
     FT_Error error;
     lv_font_fmt_ft_dsc_t * dsc = (lv_font_fmt_ft_dsc_t *)(font->dsc);
-    if(dsc->failed)
+    if(dsc->failed || dsc->retry_needed)
         return false;
     FT_Face face = dsc->size->face;
 
@@ -506,9 +557,10 @@ static bool get_glyph_dsc_cb_nocache(const lv_font_t * font,
     }
     dsc_out->is_placeholder = glyph_index == 0;
 
+    errno = 0;
     error = FT_Load_Glyph(face, glyph_index, FT_LOAD_DEFAULT);
     if(error) {
-        dsc->failed = true;
+        font_glyph_error(dsc, error);
         return false;
     }
 
@@ -528,9 +580,10 @@ static bool get_glyph_dsc_cb_nocache(const lv_font_t * font,
         }
     }
 
+    errno = 0;
     error = FT_Render_Glyph(face->glyph, FT_RENDER_MODE_NORMAL);
     if(error) {
-        dsc->failed = true;
+        font_glyph_error(dsc, error);
         return false;
     }
 
@@ -546,6 +599,7 @@ static bool get_glyph_dsc_cb_nocache(const lv_font_t * font,
         dsc_out->adv_w = dsc_out->box_w + dsc_out->ofs_x;
     }
 
+    font_glyph_succeeded(dsc);
     return true;
 }
 
@@ -553,7 +607,7 @@ static const uint8_t * get_glyph_bitmap_cb_nocache(const lv_font_t * font, uint3
 {
     LV_UNUSED(unicode_letter);
     lv_font_fmt_ft_dsc_t * dsc = (lv_font_fmt_ft_dsc_t *)(font->dsc);
-    if(dsc->failed)
+    if(dsc->failed || dsc->retry_needed)
         return NULL;
     FT_Face face = dsc->size->face;
     return (const uint8_t *)(face->glyph->bitmap.buffer);
